@@ -1,0 +1,50 @@
+name: Gold & Silver price bot
+
+on:
+  schedule:
+    # Every 15 min, 03:00-12:59 UTC (about 08:45-18:45 Nepal time).
+    # Hamro Patro usually updates around 11 AM NPT.
+    - cron: "*/15 3-12 * * *"
+  workflow_dispatch: # manual run from the Actions tab sends the current price as a test
+
+permissions:
+  contents: write # lets the job commit state.json
+
+concurrency:
+  group: gold-bot
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check prices and notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python bot.py --force
+          else
+            python bot.py --once
+          fi
+
+      - name: Save last-seen prices
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "gold-bot"
+            git config user.email "gold-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update prices"
+            git push
+          fi
