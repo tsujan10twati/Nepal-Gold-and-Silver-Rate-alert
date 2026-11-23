@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Telegram bot: sends Nepal gold & silver prices (from Hamro Patro) whenever they update.
+Telegram bot: sends Nepal gold & silver prices whenever they change.
+
+Price source: sharehubnepal.com (more pages can be added to SOURCE_URLS as fallbacks).
 
 Setup
 -----
 1. In Telegram, talk to @BotFather -> /newbot -> copy the token.
-2. Send any message to your new bot, then open
+2. Message your bot (press Start), then open
    https://api.telegram.org/bot<TOKEN>/getUpdates  and copy  "chat":{"id": ...}
-   (For a channel: add the bot as admin and use @channelname as the chat id.)
+   (groups have negative ids; for a channel use @channelname)
 3. pip install requests beautifulsoup4
 4. export TELEGRAM_BOT_TOKEN="123456:ABC..."
-   export TELEGRAM_CHAT_IDS="111111111,@mychannel"      # comma-separated
-5. python bot.py --debug      # check the parser reads the page correctly
+   export TELEGRAM_CHAT_IDS="111111111,-100222222222"      # comma-separated
+5. python bot.py --debug      # shows what each source returns, sends nothing
    python bot.py --force      # send the current price once, as a test
    python bot.py              # run forever, checking every 10 minutes
-
-Run it somewhere that stays on (VPS, Raspberry Pi, Render/Railway/Fly, etc.).
-For cron / GitHub Actions use `python bot.py --once` (state is kept in state.json).
+   python bot.py --once       # single check (for cron / GitHub Actions)
 """
 import argparse
 import html
@@ -30,7 +30,10 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-URL = "https://www.hamropatro.com/gold"
+SOURCE_URLS = {
+    "sharehub": "https://sharehubnepal.com/economy/gold-silver-rates",
+}
+SOURCES = [s.strip() for s in os.environ.get("SOURCES", "sharehub").split(",") if s.strip()]
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
@@ -40,36 +43,95 @@ CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(","
 
 
 # ---------------------------------------------------------------- scraping
-def fetch_text(save_html=False):
-    r = requests.get(URL, headers=HEADERS, timeout=30)
+def fetch_text(url, attempts=2):
+    r = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code < 400:
+                break
+            print(f"  attempt {attempt}: HTTP {r.status_code}", file=sys.stderr)
+        except requests.RequestException as e:
+            print(f"  attempt {attempt}: {e}", file=sys.stderr)
+        if attempt < attempts:
+            time.sleep(10)
+    if r is None:
+        raise RuntimeError("no response")
     r.raise_for_status()
-    if save_html:
-        Path("page.html").write_text(r.text, encoding="utf-8")
     soup = BeautifulSoup(r.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
 
 
-def _price_after(label_regex, text):
-    # Price = first "Rs 2,42,600" after the label, without running into another
-    # label (so headings like "Gold & Silver Price" can't steal the wrong number).
-    pattern = label_regex + r"(?:(?!Gold|Silver).){0,200}?Rs\.?\s*([\d,]+)"
-    for m in re.finditer(pattern, text, re.I):
-        value = int(m.group(1).replace(",", "") or 0)
-        if value > 0:
-            return value
+NUM = r"\d{1,3}(?:,\d{2,3})+"  # numbers with thousands separators: 2,42,600 / 242,600 / 3,065
+
+
+def _price_after(label, text):
+    """Take the first two comma-formatted numbers after `label` (stopping before the
+    next 'Gold'/'Silver' label) and return the larger one: a tola is heavier than
+    10 g, so the per-tola price is always the bigger of the pair."""
+    pattern = label + r"((?:(?!Gold|Silver).){0,160})"
+    for m in re.finditer(pattern, text):
+        nums = [int(n.replace(",", "")) for n in re.findall(NUM, m.group(1))[:2]]
+        if nums:
+            return max(nums)
     return None
 
 
 def parse(text):
-    gold = _price_after(r"Gold\s*\(?\s*Hallmark\s*\)?", text)
+    gold = _price_after(r"[Gg]old\s*\(?\s*[Hh]allmark", text)
     silver = _price_after(r"Silver", text)
-    m = re.search(r"Last\s*updated:?\s*(.{0,40}?\d{1,2}:\d{2}\s*[ap]m)", text, re.I)
+    m = re.search(r"Last\s*updated:?\s*(.{0,40}?\d{1,2}:\d{2}\s*[ap]m)", text, re.I) \
+        or re.search(r"updated on\s+(\d{1,2}\s+\w+\s+\d{4})", text, re.I)
     updated = re.sub(r"\s*\((?:today|yesterday)\)", "", m.group(1), flags=re.I).strip() if m else ""
     if not gold or not silver or gold < silver * 10:  # sanity check
-        raise ValueError(f"Could not parse prices (gold={gold}, silver={silver})")
+        raise ValueError(f"could not parse prices (gold={gold}, silver={silver}); page starts: {text[:200]!r}")
     return {"gold": gold, "silver": silver, "updated": updated}
+
+
+def parse_sharehub(text):
+    """sharehubnepal.com lays out cards: HALMARK GOLD [1 TOLA Rs. x, 10 GRAMS Rs. y],
+    TEJABI GOLD [...], SILVER [...]. Read the '1 TOLA' price inside each card."""
+    hall = re.search(r"HAL+MARK GOLD", text)
+    if not hall:
+        raise ValueError(f"hallmark card not found; page starts: {text[:200]!r}")
+    tej = re.search(r"TEJABI GOLD", text[hall.end():])
+    tej_end = hall.end() + tej.end() if tej else hall.end()
+    silver = re.search(r"SILVER", text[tej_end:])
+    if not silver:
+        raise ValueError(f"silver card not found; page starts: {text[:200]!r}")
+    silver_start = tej_end + silver.start()
+    tola = r"1\s*TOLA\D{0,15}?(" + NUM + ")"
+    g = re.search(tola, text[hall.end():hall.end() + 400])
+    s = re.search(tola, text[silver_start:silver_start + 400])
+    gold_v = int(g.group(1).replace(",", "")) if g else None
+    silver_v = int(s.group(1).replace(",", "")) if s else None
+    m = re.search(r"Updated:\s*(\d{4}-\d{2}-\d{2})", text)
+    updated = m.group(1) if m else ""
+    if not gold_v or not silver_v or gold_v < silver_v * 10:
+        raise ValueError(f"could not parse prices (gold={gold_v}, silver={silver_v}); page starts: {text[:200]!r}")
+    return {"gold": gold_v, "silver": silver_v, "updated": updated}
+
+
+PARSERS = {"sharehub": parse_sharehub}  # everything else uses parse()
+
+
+def get_prices():
+    errors = []
+    for name in SOURCES:
+        url = SOURCE_URLS.get(name)
+        if not url:
+            continue
+        try:
+            print(f"Trying {name} ...")
+            cur = PARSERS.get(name, parse)(fetch_text(url))
+            cur["source"] = name
+            return cur
+        except Exception as e:
+            print(f"  {name} failed: {e}", file=sys.stderr)
+            errors.append(f"{name}: {e}")
+    raise RuntimeError("all sources failed -> " + " | ".join(errors))
 
 
 # ---------------------------------------------------------------- formatting
@@ -100,7 +162,7 @@ def build_message(cur, prev):
     ]
     if cur["updated"]:
         lines += ["", f"🕚 {html.escape(cur['updated'])}"]
-    lines.append(f'<a href="{URL}">Hamro Patro</a>')
+    lines.append(f"<i>Source: {html.escape(cur.get('source', ''))}</i>")
     return "\n".join(lines)
 
 
@@ -126,9 +188,10 @@ def load_state():
 
 
 def check(force=False):
-    cur = parse(fetch_text())
+    cur = get_prices()
     prev = load_state()
-    if force or prev != cur:
+    changed = not prev or (prev.get("gold"), prev.get("silver")) != (cur["gold"], cur["silver"])
+    if force or changed:
         send(build_message(cur, prev))
         STATE_FILE.write_text(json.dumps(cur))
         print("Sent update:", cur)
@@ -140,13 +203,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="check once and exit")
     ap.add_argument("--force", action="store_true", help="send current price even if unchanged")
-    ap.add_argument("--debug", action="store_true", help="print parsed values, save page.html, send nothing")
+    ap.add_argument("--debug", action="store_true", help="show what each source returns, send nothing")
     args = ap.parse_args()
 
     if args.debug:
-        text = fetch_text(save_html=True)
-        print("Page text (first 600 chars):\n", text[:600], "\n")
-        print("Parsed:", parse(text))
+        for name in SOURCES:
+            print(f"\n=== {name} ===")
+            try:
+                text = fetch_text(SOURCE_URLS[name])
+                print("Page text (first 500 chars):", text[:500])
+                print("Parsed:", PARSERS.get(name, parse)(text))
+            except Exception as e:
+                print("FAILED:", e)
         return
 
     if not TOKEN or not CHAT_IDS:
@@ -165,7 +233,7 @@ def main():
             failures += 1
             print(f"Check failed ({failures}): {e}", file=sys.stderr)
             if failures == 6:  # ~1 hour of failures -> tell the user once
-                send(f"⚠️ Gold bot can't read Hamro Patro: {html.escape(str(e))}")
+                send(f"⚠️ Gold bot can't read any price source: {html.escape(str(e)[:500])}")
         time.sleep(POLL_SECONDS)
 
 
