@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 15 min, 03:00-12:59 UTC (about 08:45-18:45 Nepal time).
     # Hamro Patro usually updates around 11 AM NPT.
-    - cron: "*/15 3-12 * * *"
+    - cron: "*/7,22,37,52 3-12 * * *"
   workflow_dispatch: # manual run from the Actions tab sends the current price as a test
 
 permissions:
