@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -146,19 +147,23 @@ def npr(n):
 
 
 def delta(new, old):
-    if old is None or new == old:
+    """Change versus yesterday's price, on its own indented line."""
+    if not old:
         return ""
+    if new == old:
+        return "\n      ▬ same as yesterday"
     arrow = "🔺" if new > old else "🔻"
-    return f"  {arrow} {npr(abs(new - old))}"
+    pct = (new - old) / old * 100
+    return f"\n      {arrow} {npr(abs(new - old))} ({pct:+.1f}%) since yesterday"
 
 
-def build_message(cur, prev):
-    prev = prev or {}
+def build_message(cur, yday):
+    yday = yday or {}
     lines = [
         "🪙 <b>Gold &amp; Silver — Nepal</b>",
         "",
-        f"🥇 Gold (Hallmark): <b>Rs {npr(cur['gold'])}</b> /tola{delta(cur['gold'], prev.get('gold'))}",
-        f"🥈 Silver: <b>Rs {npr(cur['silver'])}</b> /tola{delta(cur['silver'], prev.get('silver'))}",
+        f"🥇 Gold (Hallmark): <b>Rs {npr(cur['gold'])}</b> /tola{delta(cur['gold'], yday.get('gold'))}",
+        f"🥈 Silver: <b>Rs {npr(cur['silver'])}</b> /tola{delta(cur['silver'], yday.get('silver'))}",
     ]
     if cur["updated"]:
         lines += ["", f"🕚 {html.escape(cur['updated'])}"]
@@ -187,12 +192,31 @@ def load_state():
         return None
 
 
+NPT = timezone(timedelta(hours=5, minutes=45))  # Nepal time
+
+
+def today_npt():
+    return datetime.now(NPT).strftime("%Y-%m-%d")
+
+
+def yesterday_prices(state):
+    """Last price saved on an earlier day (Nepal time) = the previous day's final price."""
+    hist = (state or {}).get("history", {})
+    earlier = sorted(d for d in hist if d < today_npt())
+    return hist[earlier[-1]] if earlier else None
+
+
 def check(force=False):
     cur = get_prices()
-    prev = load_state()
-    changed = not prev or (prev.get("gold"), prev.get("silver")) != (cur["gold"], cur["silver"])
+    state = load_state() or {}
+    changed = (state.get("gold"), state.get("silver")) != (cur["gold"], cur["silver"])
     if force or changed:
-        send(build_message(cur, prev))
+        send(build_message(cur, yesterday_prices(state)))
+        hist = state.get("history", {})
+        hist[today_npt()] = {"gold": cur["gold"], "silver": cur["silver"]}  # latest price of today
+        for d in sorted(hist)[:-14]:  # keep two weeks
+            del hist[d]
+        cur["history"] = hist
         STATE_FILE.write_text(json.dumps(cur))
         print("Sent update:", cur)
     else:
