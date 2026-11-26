@@ -3,8 +3,11 @@ name: Gold & Silver price bot
 on:
   schedule:
     # GitHub cron uses UTC; Nepal time is UTC+5:45.
-    # 04:15, 05:15, 07:15 UTC = 10:00 AM, 11:00 AM, 1:00 PM Nepal time.
-    - cron: "15 4,5,7 * * *"
+    # Every 15 minutes from 10:07 AM to 1:52 PM Nepal time (UTC+5:45), daily.
+    # Odd minutes avoid the busy :00/:15 UTC slots GitHub often skips.
+    - cron: "22,37,52 4 * * *"      # 10:07, 10:22, 10:37 NPT
+    - cron: "7,22,37,52 5-7 * * *"  # 10:52 AM - 1:37 PM NPT
+    - cron: "7 8 * * *"             # 1:52 PM NPT
   workflow_dispatch: # manual run from the Actions tab sends the current price as a test
 
 permissions:
